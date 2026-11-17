@@ -21,16 +21,13 @@ use std::{
     io::Result,
     os::unix::{
         fs::OpenOptionsExt,
-        io::{FromRawFd, IntoRawFd, RawFd},
+        io::{AsRawFd, OwnedFd},
     },
     process::Stdio,
     sync::Mutex,
 };
 
-use log::debug;
 use nix::unistd::{Gid, Uid};
-#[cfg(not(feature = "async"))]
-use os_pipe::{PipeReader, PipeWriter};
 #[cfg(feature = "async")]
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -104,8 +101,8 @@ impl Default for IOOption {
 /// When one side of the pipe is closed, the state will be represented with [`None`].
 #[derive(Debug)]
 pub struct Pipe {
-    rd: RawFd,
-    wr: RawFd,
+    rd: Mutex<Option<File>>,
+    wr: Mutex<Option<File>>,
 }
 
 #[derive(Debug)]
@@ -119,8 +116,8 @@ impl Pipe {
     fn new() -> std::io::Result<Self> {
         let (rd, wr) = os_pipe::pipe()?;
         Ok(Self {
-            rd: rd.into_raw_fd(),
-            wr: wr.into_raw_fd(),
+            rd: Mutex::new(Some(File::from(OwnedFd::from(rd)))),
+            wr: Mutex::new(Some(File::from(OwnedFd::from(wr)))),
         })
     }
 }
@@ -143,15 +140,13 @@ impl PipedIo {
         if !enabled {
             return Ok(None);
         }
-
         let pipe = Pipe::new()?;
-        let uid = Some(Uid::from_raw(uid));
-        let gid = Some(Gid::from_raw(gid));
-        if stdin {
-            nix::unistd::fchown(pipe.rd, uid, gid)?;
-        } else {
-            nix::unistd::fchown(pipe.wr, uid, gid)?;
-        }
+        let end = if stdin { &pipe.rd } else { &pipe.wr };
+        nix::unistd::fchown(
+            end.lock().unwrap().as_ref().unwrap().as_raw_fd(),
+            Some(Uid::from_raw(uid)),
+            Some(Gid::from_raw(gid)),
+        )?;
         Ok(Some(pipe))
     }
 }
@@ -159,80 +154,69 @@ impl PipedIo {
 impl Io for PipedIo {
     #[cfg(not(feature = "async"))]
     fn stdin(&self) -> Option<Box<dyn Write + Send + Sync>> {
-        self.stdin.as_ref().map(|pipe| {
-            let writer = unsafe { PipeWriter::from_raw_fd(pipe.wr) };
-            Box::new(writer) as Box<dyn Write + Send + Sync>
-        })
+        Some(Box::new(self.stdin.as_ref()?.wr.lock().unwrap().take()?))
     }
-
     #[cfg(feature = "async")]
     fn stdin(&self) -> Option<Box<dyn AsyncWrite + Send + Sync + Unpin>> {
-        self.stdin.as_ref().and_then(|pipe| {
-            tokio_pipe::PipeWrite::from_raw_fd_checked(pipe.wr)
-                .map(|x| Box::new(x) as Box<dyn AsyncWrite + Send + Sync + Unpin>)
-                .ok()
-        })
+        let fd = self.stdin.as_ref()?.wr.lock().unwrap().take()?;
+        tokio::net::unix::pipe::Sender::from_owned_fd(fd.into())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn AsyncWrite + Send + Sync + Unpin>)
     }
-
     #[cfg(not(feature = "async"))]
     fn stdout(&self) -> Option<Box<dyn Read + Send>> {
-        self.stdout.as_ref().map(|pipe| {
-            let reader = unsafe { PipeReader::from_raw_fd(pipe.rd) };
-            Box::new(reader) as Box<dyn Read + Send>
-        })
+        Some(Box::new(self.stdout.as_ref()?.rd.lock().unwrap().take()?))
     }
-
     #[cfg(feature = "async")]
     fn stdout(&self) -> Option<Box<dyn AsyncRead + Send + Sync + Unpin>> {
-        self.stdout.as_ref().and_then(|pipe| {
-            tokio_pipe::PipeRead::from_raw_fd_checked(pipe.rd)
-                .map(|x| Box::new(x) as Box<dyn AsyncRead + Send + Sync + Unpin>)
-                .ok()
-        })
+        let fd = self.stdout.as_ref()?.rd.lock().unwrap().take()?;
+        tokio::net::unix::pipe::Receiver::from_owned_fd(fd.into())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn AsyncRead + Send + Sync + Unpin>)
     }
-
     #[cfg(not(feature = "async"))]
     fn stderr(&self) -> Option<Box<dyn Read + Send>> {
-        self.stderr.as_ref().map(|pipe| {
-            let reader = unsafe { PipeReader::from_raw_fd(pipe.rd) };
-            Box::new(reader) as Box<dyn Read + Send>
-        })
+        Some(Box::new(self.stderr.as_ref()?.rd.lock().unwrap().take()?))
     }
-
     #[cfg(feature = "async")]
     fn stderr(&self) -> Option<Box<dyn AsyncRead + Send + Sync + Unpin>> {
-        self.stderr.as_ref().and_then(|pipe| {
-            tokio_pipe::PipeRead::from_raw_fd_checked(pipe.rd)
-                .map(|x| Box::new(x) as Box<dyn AsyncRead + Send + Sync + Unpin>)
-                .ok()
-        })
+        let fd = self.stderr.as_ref()?.rd.lock().unwrap().take()?;
+        tokio::net::unix::pipe::Receiver::from_owned_fd(fd.into())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn AsyncRead + Send + Sync + Unpin>)
     }
 
-    // Note that this internally use [`std::fs::File`]'s `try_clone()`.
-    // Thus, the files passed to commands will be not closed after command exit.
-    fn set(&self, cmd: &mut Command) -> std::io::Result<()> {
+    fn set(&self, cmd: &mut Command) -> Result<()> {
+        // Command owns clones, never another owner of the same descriptor.
+        // Originals remain owned here until after_start or cancellation/drop.
         if let Some(p) = self.stdin.as_ref() {
-            cmd.stdin(unsafe { Stdio::from_raw_fd(p.rd) });
+            if let Some(file) = p.rd.lock().unwrap().as_ref() {
+                cmd.stdin(Stdio::from(file.try_clone()?));
+            }
         }
-
         if let Some(p) = self.stdout.as_ref() {
-            cmd.stdout(unsafe { Stdio::from_raw_fd(p.wr) });
+            if let Some(file) = p.wr.lock().unwrap().as_ref() {
+                cmd.stdout(Stdio::from(file.try_clone()?));
+            }
         }
-
         if let Some(p) = self.stderr.as_ref() {
-            cmd.stderr(unsafe { Stdio::from_raw_fd(p.wr) });
+            if let Some(file) = p.wr.lock().unwrap().as_ref() {
+                cmd.stderr(Stdio::from(file.try_clone()?));
+            }
         }
-
         Ok(())
     }
 
     fn close_after_start(&self) {
-        if let Some(p) = self.stdout.as_ref() {
-            nix::unistd::close(p.wr).unwrap_or_else(|e| debug!("close stdout: {}", e));
+        // Idempotently release only the child ends still owned by this object.
+        if let Some(p) = self.stdin.as_ref() {
+            p.rd.lock().unwrap().take();
         }
-
+        if let Some(p) = self.stdout.as_ref() {
+            p.wr.lock().unwrap().take();
+        }
         if let Some(p) = self.stderr.as_ref() {
-            nix::unistd::close(p.wr).unwrap_or_else(|e| debug!("close stderr: {}", e));
+            p.wr.lock().unwrap().take();
         }
     }
 }
@@ -352,6 +336,109 @@ impl Io for FIFO {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn pipe_endpoints_are_claimed_once_and_close_with_their_owners() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let io = PipedIo::new(
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+            &IOOption::default(),
+        )
+        .unwrap();
+        let mut input = io.stdin().unwrap();
+        let mut output = io.stdout().unwrap();
+        let mut error = io.stderr().unwrap();
+        assert!(io.stdin().is_none() && io.stdout().is_none() && io.stderr().is_none());
+        let mut command = Command::new("/bin/cat");
+        io.set(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        io.close_after_start();
+        io.close_after_start();
+        drop(io);
+        input.write_all(b"owned pipe bytes").await.unwrap();
+        drop(input);
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            output.read_to_end(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(bytes, b"owned pipe bytes");
+        assert_eq!(error.read(&mut [0]).await.unwrap(), 0);
+        assert!(child.wait().await.unwrap().success());
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn unused_child_pipe_end_is_closed_on_cancel() {
+        use tokio::io::AsyncReadExt;
+        let io = PipedIo::new(
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+            &IOOption {
+                open_stdin: false,
+                open_stdout: true,
+                open_stderr: false,
+            },
+        )
+        .unwrap();
+        let mut output = io.stdout().unwrap();
+        drop(io);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), output.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn command_drop_must_not_leave_a_stale_fd_for_after_start() {
+        let io = PipedIo::new(
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+            &IOOption {
+                open_stdin: false,
+                open_stdout: true,
+                open_stderr: false,
+            },
+        )
+        .unwrap();
+        let original = io
+            .stdout
+            .as_ref()
+            .unwrap()
+            .wr
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_raw_fd();
+        let mut command = Command::new("/bin/true");
+        io.set(&mut command).unwrap();
+        drop(command);
+        let file = File::open("/dev/null").unwrap();
+        use std::os::unix::io::AsRawFd;
+        // Reserve an available descriptor at or above the former pipe endpoint.
+        // It has no automatic owner, so the broken implementation cannot cause
+        // a second destructor close after the assertion detects its mistake.
+        let probe = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, original) };
+        assert!(probe >= 0);
+        io.close_after_start();
+        let valid = unsafe { libc::fcntl(probe, libc::F_GETFD) } >= 0;
+        if valid {
+            unsafe {
+                libc::close(probe);
+            }
+        }
+        assert!(valid, "after_start closed an unrelated reused FD");
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn test_io_option() {
@@ -381,25 +468,46 @@ mod tests {
         stdin.write_all(&buf).unwrap();
         buf[0] = 0x0;
 
-        io.stdin
-            .as_ref()
-            .map(|v| v.rd.try_clone().unwrap().read(&mut buf).unwrap());
+        io.stdin.as_ref().map(|v| {
+            v.rd.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .unwrap()
+                .read(&mut buf)
+                .unwrap()
+        });
         assert_eq!(&buf, &[0xfau8]);
 
         let mut stdout = io.stdout().unwrap();
         buf[0] = 0xce;
-        io.stdout
-            .as_ref()
-            .map(|v| v.wr.try_clone().unwrap().write(&buf).unwrap());
+        io.stdout.as_ref().map(|v| {
+            v.wr.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .unwrap()
+                .write(&buf)
+                .unwrap()
+        });
         buf[0] = 0x0;
         stdout.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, &[0xceu8]);
 
         let mut stderr = io.stderr().unwrap();
         buf[0] = 0xa5;
-        io.stderr
-            .as_ref()
-            .map(|v| v.wr.try_clone().unwrap().write(&buf).unwrap());
+        io.stderr.as_ref().map(|v| {
+            v.wr.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .unwrap()
+                .write(&buf)
+                .unwrap()
+        });
         buf[0] = 0x0;
         stderr.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, &[0xa5u8]);

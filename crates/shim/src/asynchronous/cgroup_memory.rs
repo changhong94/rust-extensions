@@ -16,28 +16,26 @@
 
 #![cfg(target_os = "linux")]
 
-use cgroups_rs::hierarchies::is_cgroup2_unified_mode;
-use log::warn;
 use std::{
-    os::unix::io::{AsRawFd, FromRawFd},
+    os::unix::io::{AsRawFd, OwnedFd},
     path::Path,
 };
 
-use crate::{
-    error::{Error, Result},
-    io_error, other_error,
-};
-
-use crate::event::Event;
-use containerd_shim_protos::events::task::TaskOOM;
-use containerd_shim_protos::protobuf::MessageDyn;
+use cgroups_rs::hierarchies::is_cgroup2_unified_mode;
+use containerd_shim_protos::{events::task::TaskOOM, protobuf::MessageDyn};
+use log::warn;
 use nix::sys::eventfd::{EfdFlags, EventFd};
-use tokio::sync::mpsc::Sender;
 use tokio::{
     fs::{self, read_to_string, File},
     io::AsyncReadExt,
     spawn,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
+};
+
+use crate::{
+    error::{Error, Result},
+    event::Event,
+    io_error, other_error,
 };
 
 pub type EventSender = Sender<(String, Box<dyn MessageDyn>)>;
@@ -152,7 +150,10 @@ pub async fn register_memory_event(
     let key = key.to_string();
 
     tokio::spawn(async move {
-        let mut eventfd_file = unsafe { File::from_raw_fd(eventfd.as_raw_fd()) };
+        // Transfer ownership; constructing File from as_raw_fd would leave
+        // EventFd owning the same descriptor and double-close it on teardown.
+        let owned: OwnedFd = eventfd.into();
+        let mut eventfd_file = File::from_std(std::fs::File::from(owned));
         loop {
             match eventfd_file.read(&mut buf).await {
                 Ok(bytes_read) if bytes_read == 0 => return,
@@ -173,15 +174,51 @@ pub async fn register_memory_event(
 mod tests {
     use std::path::Path;
 
-    use crate::asynchronous::cgroup_memory::{
-        get_existing_cgroup_mem_path, get_path_from_cgorup, register_memory_event,
-    };
     use cgroups_rs::{
         hierarchies::{self, is_cgroup2_unified_mode},
         memory::MemController,
         Cgroup, CgroupPid,
     };
     use tokio::{fs::remove_file, io::AsyncWriteExt, process::Command};
+
+    use crate::asynchronous::cgroup_memory::{
+        get_existing_cgroup_mem_path, get_path_from_cgorup, register_memory_event,
+    };
+
+    #[tokio::test]
+    async fn test_memory_event_teardown_closes_eventfd_once() {
+        use std::{io::Write, os::unix::io::FromRawFd};
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("cgroup.event_control");
+        tokio::fs::write(dir.path().join("memory.oom_control"), b"")
+            .await
+            .unwrap();
+        // A regular control file captures the registration FDs without requiring
+        // cgroup-v1 privileges. The eventfd and its async read are real.
+        let mut rx = register_memory_event("test", dir.path(), "memory.oom_control")
+            .await
+            .unwrap();
+        let registration = tokio::fs::read_to_string(&control).await.unwrap();
+        let fd: i32 = registration
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let duplicate = nix::unistd::dup(fd).unwrap();
+        // SAFETY: dup returned a fresh descriptor owned only by this File.
+        let mut trigger = unsafe { std::fs::File::from_raw_fd(duplicate) };
+        tokio::fs::remove_file(control).await.unwrap();
+        trigger.write_all(&1u64.to_ne_bytes()).unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The monitor has exited. A duplicate owned by the caller is still valid.
+        trigger.write_all(&1u64.to_ne_bytes()).unwrap();
+    }
 
     #[tokio::test]
     async fn test_cgroupv1_oom_monitor() {
