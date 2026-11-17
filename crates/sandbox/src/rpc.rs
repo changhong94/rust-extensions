@@ -6,12 +6,12 @@ use time::OffsetDateTime;
 use tokio::fs::{create_dir_all, remove_dir_all};
 use tonic::{Request, Response, Status};
 
-use crate::api::sandbox::v1::controller_server::Controller;
-use crate::api::sandbox::v1::*;
-use crate::data::{ContainerData, ProcessData, ProcessResource, SandboxData, TaskResources};
-use crate::{Container, ContainerOption, Sandbox, SandboxOption, SandboxStatus, Sandboxer};
-
-use crate::utils::cleanup_mounts;
+use crate::{
+    api::sandbox::v1::{controller_server::Controller, *},
+    data::{ContainerData, ProcessData, ProcessResource, SandboxData, TaskResources},
+    utils::cleanup_mounts,
+    Container, ContainerOption, Sandbox, SandboxOption, SandboxStatus, Sandboxer,
+};
 
 const SANDBOX_STATUS_READY: &str = "SANDBOX_READY";
 const SANDBOX_STATUS_NOTREADY: &str = "SANDBOX_NOTREADY";
@@ -241,8 +241,17 @@ where
             SandboxStatus::Stopped(_, _) => (SANDBOX_STATUS_NOTREADY.to_string(), 0),
             SandboxStatus::Paused => (SANDBOX_STATUS_NOTREADY.to_string(), 0),
         };
+        let mut info = std::collections::HashMap::new();
         let (created_at, exited_at, address) = {
             let data = sandbox.get_data()?;
+            // The sandboxer owns the live process inventory used by VM fork.
+            // Advertise it explicitly so clients can recover after reconnect or
+            // daemon restart without duplicating ephemeral exec records in Bolt.
+            if req.verbose && data.task_address.starts_with("ttrpc+hvsock://") {
+                let tasks = serde_json::to_string(&data.task_resources()?)
+                    .map_err(|e| Status::internal(format!("serialize runtime tasks: {}", e)))?;
+                info.insert("io.kuasar.runtime-tasks.v1".to_owned(), tasks);
+            }
             (
                 data.created_at.map(|x| x.into()),
                 data.exited_at.map(|x| x.into()),
@@ -250,12 +259,11 @@ where
             )
         };
         debug!("status sandbox {} returns {:?}", req.sandbox_id, state);
-        // TODO add verbose support
         return Ok(Response::new(ControllerStatusResponse {
             sandbox_id: req.sandbox_id.to_string(),
             pid,
             state,
-            info: Default::default(),
+            info,
             created_at,
             exited_at,
             extra: None,
